@@ -3,15 +3,15 @@ import numpy as np
 import time
 import matplotlib.pyplot as plt
 
-def get_nHSMatrix_psi(n, x, theta=0):
+def get_nhermit_psi(n, x, theta=0):
     coef = (1/np.sqrt(np.pi))**0.5
     for i in range(n):
-        yield coef*sp.HSMatrix(i, monic=True)(x)*np.exp(-x*x/2)
+        yield coef*sp.hermite(i, monic=True)(x)*np.exp(-x*x/2)
         coef = coef/((i+1)/2)**0.5*np.exp(-1j*theta)
         
 
 def MLE(n_exp, x, theta, num_basis):
-    PSI = np.array([arr for arr in get_nHSMatrix_psi(num_basis, x, theta=0)])
+    PSI = np.array([arr for arr in get_nhermit_psi(num_basis, x, theta=0)])
     THETA = np.exp(-1j*np.tensordot(theta, np.arange(num_basis), axes=0))
     PSI_THETA = np.einsum("nx,tn->nxt", PSI, THETA)
     lam = np.sum(n_exp)
@@ -39,7 +39,7 @@ def MLE(n_exp, x, theta, num_basis):
     return c
 
 def theory(rho_meas, n,x,theta=0):
-    hx = np.array([d for d in get_nHSMatrix_psi(n, x, theta)])
+    hx = np.array([d for d in get_nhermit_psi(n, x, theta)])
     rho_x = np.einsum("ni,nm,mi->i", hx, rho_meas, hx.conjugate())
     return rho_x.real
 
@@ -60,7 +60,7 @@ if __name__ == "__main__":
     
     print("fideleity: ", 1 - abs(c@s)**2)
     
-    PSI = np.array([arr for arr in get_nHSMatrix_psi(num_basis, x, theta=0)])
+    PSI = np.array([arr for arr in get_nhermit_psi(num_basis, x, theta=0)])
     p_theory = np.einsum("n,m,nx,mx->x", s, s.conjugate(), PSI, PSI.conjugate())
     p_mle = np.einsum("n,m,nx,mx->x", c, c.conjugate(), PSI, PSI.conjugate())
     plt.plot(x, p_theory.real, label="theory")

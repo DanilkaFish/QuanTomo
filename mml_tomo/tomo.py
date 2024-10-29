@@ -10,12 +10,19 @@ Url = (I - 1j*X)/np.sqrt(2)
 Uda = (I + 1j*Y)/np.sqrt(2)
 Uhv = I
 U1 = np.array([Uhv, Uda, Url])
-    
-def rho_projection(rho):
+        
+
+def rho_projection(rho, get_c=False, r=None):
     eigvl, eigenv = np.linalg.eigh(rho)
     while np.any(eigvl<0):
         eigvl = np.where(eigvl < 0, 0, eigvl) 
         eigvl = eigvl - (np.sum(eigvl) - 1)/np.sum(eigvl > 0)
+
+    if get_c:
+        if r is None:
+            r = np.sum(eigvl>0)
+
+        return eigenv[:, -r:] @ np.diag(np.sqrt(eigvl[-r:]))
     return  eigenv @ np.diag(eigvl) \
                    @ eigenv.T.conj()
 
@@ -27,6 +34,9 @@ def fidelity_rho_rho(rho1, rho2):
     evalues, _ = np.linalg.eig(mead)
     return np.sum(np.sqrt(evalues))
 
+def get_chi(k, probs, n_exp):
+    return np.sum((n_exp*k[:,0:-1] - n_exp*probs[:,0:-1])**2/n_exp/probs[:,0:-1]/(1 - probs[:,0:-1]))
+
 def process(data: np.array):
     med = np.median(data)
     quan1 = np.quantile(data, 0.25)
@@ -36,12 +46,12 @@ def process(data: np.array):
 class state:
     def __init__(self, 
                  hs_size: int = 1):
-            self.hs_size = hs_size
-            pure = self.generate_psi()
-            self.rho = np.outer(pure, pure.conj())
+        self.hs_size = hs_size
+        pure = self.generate_psi()
+        self.rho = np.outer(pure, pure.conj())
             
     def generate_psi(self):
-        num_basis = self.hs_size << 1
+        num_basis =  1 << self.hs_size
         amp = np.random.uniform(0, 1, num_basis)
         return np.sqrt(amp) / np.sqrt(np.sum(amp)) \
                 * np.exp(-1j * np.random.uniform(0, 2 * np.pi, num_basis))
@@ -50,7 +60,7 @@ class state:
 class tomo:
     def __init__(self, hs_size=1):
         self.hs_size = hs_size
-        self.l = hs_size << 1
+        self.l = 1 << self.hs_size
         self.P = np.zeros((self.l, self.l, self.l))
         for i in range(self.l):
             self.P[i,i,i] = 1
@@ -60,22 +70,21 @@ class tomo:
         for i in range(1, self.hs_size):
             ush = [i*j for i,j in zip(sh, ush)]
             self.U = np.einsum("nij,mkl->nmikjl",self.U, U1).reshape(ush)
-        
-        self.Pak= np.einsum("ali,klp,apj->akij", self.U.conj(), self.P, self.U)
-        self.B = self.Pak.reshape((-1, self.l * self.l))
+        self.Pak = np.einsum("ali,klp,apj->akij", self.U.conj(), self.P, self.U)
+        self.B = np.transpose(self.Pak, (0,1,3,2)).reshape((-1, self.l * self.l))
         self.pinvB = np.linalg.pinv(self.B)
     
     def get_probs(self, s):
         if (self.hs_size != s.hs_size):
             raise ValueError("System's size mismatch: tomo " + 
                              str(self.hs_size) + " and state " + str(s.hs_size))
-        return np.einsum("ij,akij->ak", s.rho, self.Pak).real
+        return np.einsum("ji,akij->ak", s.rho, self.Pak).real
     
     def make_tomo_exp(self, probs: np.array, sample_num: int):
         return np.array([np.random.multinomial(sample_num, prob)/sample_num for prob in probs])
 
     def get_rho_by_pinv(self, sample_probs):
-        return rho_projection((self.pinvB @ sample_probs.reshape(-1)).reshape((self.l, self.l)))
+        return (self.pinvB @ sample_probs.reshape(-1)).reshape((self.l, self.l))
 
     def get_rho_by_cvx(self, sample_probs):
         X = cp.Variable((self.l, self.l), complex=True)
@@ -86,36 +95,79 @@ class tomo:
         prob.solve("SCS")
         return X.value
 
+    def MLE(self, k, c0, alpha=0.8):
+        lam = np.sum(k)
 
+        def J(c):
+            pak = np.einsum("akns,nm,sm->ak", self.Pak, c.conj(), c)
+            arr = np.einsum("ak,ak,akps->ps", k, 1/pak, self.Pak)
+            return arr
+            
+        def next(c, alpha):
+            c = alpha / lam * np.einsum("pq,qr->pr", J(c), c) + (1 - alpha)*c
+            return c
+        
+        c = next(c0, alpha)
+        c_pred = c0
+        while (np.max(np.abs(c_pred - c)) > 0.000001):
+            c_pred = c 
+            c = next(c, 0.8)
+        rho = np.einsum("pq,rq->pr", c, c.conj())
+        return rho
+    
 
 if __name__ == "__main__":
     n = 2
-    
     n_exp = 100
-    n_samples = [10,100,1000]
-    med_pinv = np.empty(len(n_samples))
-    quan_pinv_up = np.empty(len(n_samples))
-    quan_pinv_low = np.empty(len(n_samples))
-    med_cvx = np.empty(len(n_samples))
-    quan_cvx_up = np.empty(len(n_samples))
-    quan_cvx_low = np.empty(len(n_samples))
-    fid_pinv = np.empty(n_exp)
-    fid_cvx = np.empty(n_exp)
+    n_samples = [ 100, 1000,10000,100000]
     
+    med_pinv      = np.empty(len(n_samples))
+    med_mle       = np.empty(len(n_samples))
+    med_cvx       = np.empty(len(n_samples))
+    quan_pinv_up  = np.empty(len(n_samples))
+    quan_pinv_low = np.empty(len(n_samples))
+    quan_cvx_up  = np.empty(len(n_samples))
+    quan_cvx_low = np.empty(len(n_samples))
+    quan_mle_up   = np.empty(len(n_samples))
+    quan_mle_low  = np.empty(len(n_samples))
+
+    fid_pinv      = np.empty(n_exp)
+    fid_mle       = np.empty(n_exp)
+    fid_cvx       = np.empty(n_exp)
+    
+    chi           = np.empty(n_exp)
     tm = tomo(n)
     s = state(n)
     probs = tm.get_probs(s)
     for j, n_sample in enumerate(n_samples):
         for i in range(n_exp):
             sample = tm.make_tomo_exp(probs, n_sample)
-            fid_pinv[i] = fidelity_rho_rho(tm.get_rho_by_pinv(sample), s.rho).real
-            fid_cvx[i] = fidelity_rho_rho(tm.get_rho_by_cvx(sample), s.rho).real
+            chi[i] = get_chi(sample, probs, n_sample)
+            
+            almost_rho = tm.get_rho_by_pinv(sample)
+            c0         = rho_projection(almost_rho, get_c=True, r=1)
+            rho_mle    = tm.MLE(sample, c0=c0)
+            rho_pinv   = rho_projection(almost_rho)
+            rho_cvx   = rho_projection(tm.get_rho_by_cvx(sample))
+
+            fid_pinv[i] = fidelity_rho_rho(rho_pinv, s.rho).real
+            fid_mle[i] = fidelity_rho_rho(rho_mle, s.rho).real
+            fid_cvx[i] = fidelity_rho_rho(rho_cvx, s.rho).real
         med_pinv[j], quan_pinv_low[j], quan_pinv_up[j] = process(1 - fid_pinv)
+        med_mle[j], quan_mle_low[j], quan_mle_up[j] = process(1 - fid_mle)
         med_cvx[j], quan_cvx_low[j], quan_cvx_up[j] = process(1 - fid_cvx)
     
     plt.errorbar(n_samples, med_pinv, yerr=[quan_pinv_low, quan_pinv_up], label="pinv")
-    plt.errorbar(n_samples, med_cvx, yerr=[quan_cvx_low, quan_cvx_up], label="mle")
+    plt.errorbar(n_samples, med_mle, yerr=[quan_mle_low, quan_mle_up], label="mle")
+    plt.errorbar(n_samples, med_cvx, yerr=[quan_cvx_low, quan_cvx_up], label="cvx")
     plt.legend()
     plt.loglog()
-    plt.savefig("pinv_mle.png", dpi=300, bbox_inches='tight', pad_inches=0)
+    plt.grid()
+    plt.savefig("infid.png", dpi=300, bbox_inches='tight', pad_inches=0)
+    plt.close()
+    
+    
+    print(np.quantile(chi, 0.95))
+    plt.hist(chi, density=True)
+    plt.savefig("chi.png", dpi=300, bbox_inches='tight', pad_inches=0)
     plt.close()
