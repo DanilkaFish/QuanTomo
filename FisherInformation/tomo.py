@@ -31,7 +31,7 @@ def fidelity_rho_rho(rho1, rho2):
     rho_sqrt = evectors @ np.diag(evalues) @ evectors.T.conj()
     mead = rho_sqrt @ rho2 @ rho_sqrt
     evalues, _ = np.linalg.eig(mead)
-    return np.sum(np.sqrt(evalues))
+    return np.sum(np.sqrt(evalues))**2
 
 def get_chi(k, probs, n_exp):
     return np.sum((n_exp*k[:,0:-1] - n_exp*probs[:,0:-1])**2/n_exp/probs[:,0:-1]/(1 - probs[:,0:-1]))
@@ -47,8 +47,8 @@ class state:
     def __init__(self, 
                  hs_size: int = 1):
         self.hs_size = hs_size
-        pure = self.generate_psi()
-        self.rho = np.outer(pure, pure.conj())
+        self.pure = self.generate_psi()
+        self.rho = np.outer(self.pure, self.pure.conj())
             
     def generate_psi(self):
         num_basis =  1 << self.hs_size
@@ -79,7 +79,17 @@ class tomo:
             raise ValueError("System's size mismatch: tomo " + 
                              str(self.hs_size) + " and state " + str(s.hs_size))
         return np.einsum("ji,akij->ak", s.rho, self.Pak).real
-    
+        
+    def get_fisher_matrix(self, probs, c, n):
+        w = np.einsum("akij,jr->irak",self.Pak, c)
+        w = w.reshape((-1, *w.shape[2:]))
+        c = c.reshape(-1)
+        v = np.array([*np.real(w), *np.imag(w)])
+        ctilda = np.array([*np.real(c), *np.imag(c)])
+        F = 4*n*np.einsum("iak,jak,ak->ij", v, v, 1/probs)\
+            + 4*(n*n - n) * probs.shape[0] * np.einsum("i,j->ij", ctilda, ctilda)
+        return F
+
     def make_tomo_exp(self, probs: np.array, sample_num: int):
         return np.array([np.random.multinomial(sample_num, prob)/sample_num for prob in probs])
 
@@ -95,6 +105,8 @@ class tomo:
         prob.solve("SCS")
         return X.value
 
+
+
     def MLE(self, k, c0, alpha=0.8):
         lam = np.sum(k)
 
@@ -109,11 +121,11 @@ class tomo:
         
         c = next(c0, alpha)
         c_pred = c0
-        while (np.max(np.abs(c_pred - c)) > 0.000001):
+        while (np.max(np.abs(c_pred - c)) > 0.0000001):
             c_pred = c 
             c = next(c, 0.8)
-        rho = np.einsum("pq,rq->pr", c, c.conj())
-        return rho
+        # rho = np.einsum("pq,rq->pr", c, c.conj())
+        return c
     
 
 if __name__ == "__main__":
@@ -122,15 +134,12 @@ if __name__ == "__main__":
     n_samples = [ 100, 1000,10000,100000]
     
     med_pinv      = np.empty(len(n_samples))
+    inf_theory    = np.empty(len(n_samples))
+    dinf_theory    = np.empty(len(n_samples))
     med_mle       = np.empty(len(n_samples))
-    med_cvx       = np.empty(len(n_samples))
-    quan_pinv_up  = np.empty(len(n_samples))
-    quan_pinv_low = np.empty(len(n_samples))
-    quan_cvx_up   = np.empty(len(n_samples))
-    quan_cvx_low  = np.empty(len(n_samples))
     quan_mle_up   = np.empty(len(n_samples))
     quan_mle_low  = np.empty(len(n_samples))
-
+    
     fid_pinv      = np.empty(n_exp)
     fid_mle       = np.empty(n_exp)
     fid_cvx       = np.empty(n_exp)
@@ -146,20 +155,22 @@ if __name__ == "__main__":
             
             almost_rho = tm.get_rho_by_pinv(sample)
             c0         = rho_projection(almost_rho, get_c=True, r=1)
-            rho_mle    = tm.MLE(sample, c0=c0)
-            rho_pinv   = rho_projection(almost_rho)
-            rho_cvx    = rho_projection(tm.get_rho_by_cvx(sample))
+            c          = tm.MLE(sample, c0=c0)
+            rho_mle    = np.einsum("pq,rq->pr", c, c.conj())
 
-            fid_pinv[i] = fidelity_rho_rho(rho_pinv, s.rho).real
             fid_mle[i]  = fidelity_rho_rho(rho_mle, s.rho).real
-            fid_cvx[i]  = fidelity_rho_rho(rho_cvx, s.rho).real
-        med_pinv[j], quan_pinv_low[j], quan_pinv_up[j] = process(1 - fid_pinv)
+
+        c_theory = np.zeros(c.shape, dtype=np.complex128)
+        c_theory[:,0] = s.pure
+        F = tm.get_fisher_matrix(probs, c_theory, n_sample)
+        eigv = np.linalg.eig(F).eigenvalues
+        d = np.array([1/h for h in eigv if np.abs(h)>0.00001])
+        inf_theory[j] = np.sum(d)
+        dinf_theory[j] = np.sqrt(np.sum(np.outer(d,d)) + np.sum(d*d*2) - inf_theory[j]**2)
         med_mle[j], quan_mle_low[j], quan_mle_up[j] = process(1 - fid_mle)
-        med_cvx[j], quan_cvx_low[j], quan_cvx_up[j] = process(1 - fid_cvx)
     
-    plt.errorbar(n_samples, med_pinv, yerr=[quan_pinv_low, quan_pinv_up], label="pinv")
     plt.errorbar(n_samples, med_mle, yerr=[quan_mle_low, quan_mle_up], label="mle")
-    plt.errorbar(n_samples, med_cvx, yerr=[quan_cvx_low, quan_cvx_up], label="cvx")
+    plt.errorbar(n_samples, inf_theory, yerr=[inf_theory - dinf_theory, inf_theory + dinf_theory], label="via Fisher")
     plt.legend()
     plt.loglog()
     plt.grid()
